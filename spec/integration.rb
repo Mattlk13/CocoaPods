@@ -51,6 +51,7 @@ require 'colored2'
 
 require 'cocoapods-core/lockfile'
 require 'cocoapods-core/yaml_helper'
+require 'cocoapods-downloader'
 require 'fileutils'
 require 'integration/file_tree'
 require 'integration/xcodeproj_project_yaml'
@@ -66,12 +67,12 @@ CLIntegracon.configure do |c|
   c.temp_path = ROOT + 'tmp'
 
   # Transform produced project files to YAMLs
-  c.transform_produced '**/*.xcodeproj' do |path|
+  c.transform_produced '**/*.xcodeproj/project.pbxproj' do |path|
     # Creates a YAML representation of the Xcodeproj files
     # which should be used as a reference for comparison.
-    xcodeproj = Xcodeproj::Project.open(path)
+    xcodeproj = Xcodeproj::Project.open(path.parent)
     yaml = xcodeproj.to_yaml
-    path.rmtree
+    path.delete
     path.open('w') { |f| f << yaml }
   end
 
@@ -91,7 +92,7 @@ CLIntegracon.configure do |c|
     path.open('w') { |f| f << Pod::YAMLHelper.convert_hash(yaml, keys_hint, "\n\n") }
   end
 
-  c.preprocess('**/*.xcodeproj', %r{(^|/)(Podfile|Manifest).lock$}) do |path|
+  c.preprocess('**/*.xcodeproj/project.pbxproj', %r{(^|/)(Podfile|Manifest).lock$}) do |path|
     keys_hint = if path.extname == '.lock'
                   Pod::Lockfile::HASH_KEY_ORDER
                 end
@@ -103,14 +104,17 @@ CLIntegracon.configure do |c|
     end
   end
 
+  c.transform_produced('**/xcuserdata/*.xcuserdatad') do |path|
+    FileUtils.mv path, path.parent.join('INTEGRATION.xcuserdatad')
+  end
+
+  c.ignores('**/*.xcodeproj/project.xcworkspace')
+
   # So we don't need to compare them directly
   c.ignores 'Podfile'
 
   # Ignore certain OSX files
   c.ignores '.DS_Store'
-
-  # Ignore xcuserdata
-  c.ignores %r{/xcuserdata/}
 
   # Needed for some test cases
   c.ignores '*.podspec'
@@ -124,7 +128,7 @@ describe_cli 'pod' do
   has_mercurial = $?.success?
 
   subject do |s|
-    s.executable = "ruby #{ROOT + 'bin/pod'}"
+    s.executable = "ruby -W0 #{ROOT + 'bin/pod'}"
     s.environment_vars = {
       'CLAIDE_DISABLE_AUTO_WRAP'            => 'TRUE',
       'COCOAPODS_DISABLE_STATS'             => 'TRUE',
@@ -146,6 +150,8 @@ describe_cli 'pod' do
     s.replace_pattern /#{Dir.tmpdir}\/[\w-]+/io, 'TMPDIR'
     s.replace_pattern /\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [-+]\d{4}/, '<#DATE#>'
     s.replace_pattern /\(Took \d+.\d+ seconds\)/, '(Took <#DURATION#> seconds)'
+    s.replace_pattern /\b#{Regexp.escape(Pod::VERSION)}\b/, '<#Pod::VERSION#>'
+    s.replace_pattern /\b#{Regexp.escape(Pod::Downloader::VERSION)}\b/, '<#Pod::Downloader::VERSION#>'
 
     # This was changed in a very recent git version
     s.replace_pattern /git checkout -b <new-branch-name>/, 'git checkout -b new_branch_name'
@@ -171,6 +177,9 @@ describe_cli 'pod' do
     # ignore lines in the vein of `CDN: trunk Relative path: all_pods_versions_1_3_f.txt exists!`
     # they are somewhat non-deteministic and non-essential to testing integration
     s.replace_pattern /.*CDN:.*\n/, ''
+
+    # replace all git downloader output with just the command
+    s.replace_pattern %r{ > Git download\n(     \$ GIT_BIN [^\n]+\n)(     [^\n]*\n|\n)+}m, " > Git download\n\\1\n"
   end
 
   describe 'Pod install' do
@@ -313,6 +322,21 @@ describe_cli 'pod' do
       # otherwise curl output is included in execution output.
       behaves_like cli_spec 'install_vendored_dynamic_framework',
                             'install --no-repo-update --no-verbose'
+    end
+
+    describe 'Integrates a Pod using a vendored static xcframework' do
+      behaves_like cli_spec 'install_vendored_static_xcframework',
+                            'install --no-repo-update'
+    end
+
+    describe 'Integrates a Pod using a vendored static library xcframework' do
+      behaves_like cli_spec 'install_vendored_static_library_xcframework',
+                            'install --no-repo-update'
+    end
+
+    describe 'Integrates a Pod using a vendored xcframework' do
+      behaves_like cli_spec 'install_vendored_xcframework',
+                            'install --no-repo-update'
     end
 
     # @todo add tests for all the hooks API

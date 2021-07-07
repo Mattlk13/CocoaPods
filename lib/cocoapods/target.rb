@@ -1,5 +1,4 @@
 require 'cocoapods/target/build_settings'
-require 'cocoapods/target/build_type'
 
 module Pod
   # Model class which describes a Pods target.
@@ -16,12 +15,6 @@ module Pod
     # @return [Sandbox] The sandbox where the Pods should be installed.
     #
     attr_reader :sandbox
-
-    # @return [Boolean] Whether the target needs to be implemented as a framework.
-    #         Computed by analyzer.
-    #
-    attr_reader :host_requires_frameworks
-    alias_method :host_requires_frameworks?, :host_requires_frameworks
 
     # @return [Hash{String=>Symbol}] A hash representing the user build
     #         configurations where each key corresponds to the name of a
@@ -41,28 +34,37 @@ module Pod
     #
     attr_reader :build_settings
 
-    # @return [Target::BuildType] the build type for this target.
+    # @return [BuildType] the build type for this target.
     #
     attr_reader :build_type
     private :build_type
 
+    # @return [Boolean] whether the target can be linked to app extensions only.
+    #
+    attr_reader :application_extension_api_only
+
+    # @return [Boolean] whether the target must be compiled with Swift's library
+    # evolution support, necessary for XCFrameworks.
+    #
+    attr_reader :build_library_for_distribution
+
     # Initialize a new target
     #
     # @param [Sandbox] sandbox @see #sandbox
-    # @param [Boolean] host_requires_frameworks @see #host_requires_frameworks
+    # @param [BuildType] build_type @see #build_type
     # @param [Hash{String=>Symbol}] user_build_configurations @see #user_build_configurations
     # @param [Array<String>] archs @see #archs
     # @param [Platform] platform @see #platform
     #
-    def initialize(sandbox, host_requires_frameworks, user_build_configurations, archs, platform,
-                   build_type: Target::BuildType.infer_from_spec(nil, :host_requires_frameworks => host_requires_frameworks?))
+    def initialize(sandbox, build_type, user_build_configurations, archs, platform)
       @sandbox = sandbox
-      @host_requires_frameworks = host_requires_frameworks
       @user_build_configurations = user_build_configurations
       @archs = archs
       @platform = platform
       @build_type = build_type
 
+      @application_extension_api_only = false
+      @build_library_for_distribution = false
       @build_settings = create_build_settings
     end
 
@@ -206,7 +208,7 @@ module Pod
     # @return [String] A string suitable for debugging.
     #
     def inspect
-      "<#{self.class} name=#{name} >"
+      "#<#{self.class} name=#{name}>"
     end
 
     #-------------------------------------------------------------------------#
@@ -241,7 +243,7 @@ module Pod
     #
     def xcconfig_path(variant = nil)
       if variant
-        support_files_dir + "#{label}.#{variant.gsub(File::SEPARATOR, '-').downcase}.xcconfig"
+        support_files_dir + "#{label}.#{variant.to_s.gsub(File::SEPARATOR, '-').downcase}.xcconfig"
       else
         support_files_dir + "#{label}.xcconfig"
       end
@@ -300,6 +302,55 @@ module Pod
     #
     def dummy_source_path
       support_files_dir + "#{label}-dummy.m"
+    end
+
+    # Mark the target as extension-only.
+    # Translates to APPLICATION_EXTENSION_API_ONLY = YES in the build settings.
+    #
+    def mark_application_extension_api_only
+      @application_extension_api_only = true
+    end
+
+    # Compiles the target with Swift's library evolution support, necessary to
+    # build XCFrameworks.
+    # Translates to BUILD_LIBRARY_FOR_DISTRIBUTION = YES in the build settings.
+    #
+    def mark_build_library_for_distribution
+      @build_library_for_distribution = true
+    end
+
+    # @return [Pathname] The absolute path of the prepare artifacts script.
+    #
+    # @deprecated
+    #
+    # @todo Remove in 2.0
+    #
+    def prepare_artifacts_script_path
+      support_files_dir + "#{label}-artifacts.sh"
+    end
+
+    # Returns an extension in the target that corresponds to the
+    # resource's input extension.
+    #
+    # @param [String] input_extension
+    #        The input extension to map to.
+    #
+    # @return [String] The output extension.
+    #
+    def self.output_extension_for_resource(input_extension)
+      case input_extension
+      when '.storyboard'        then '.storyboardc'
+      when '.xib'               then '.nib'
+      when '.xcdatamodel'       then '.mom'
+      when '.xcdatamodeld'      then '.momd'
+      when '.xcmappingmodel'    then '.cdm'
+      when '.xcassets'          then '.car'
+      else                      input_extension
+      end
+    end
+
+    def self.resource_extension_compilable?(input_extension)
+      output_extension_for_resource(input_extension) != input_extension && input_extension != '.xcassets'
     end
 
     #-------------------------------------------------------------------------#

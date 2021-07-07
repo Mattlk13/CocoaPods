@@ -60,6 +60,11 @@ module Pod
     attr_accessor :silent
     alias_method :silent?, :silent
 
+    # @return [Bool] Whether CocoaPods is allowed to run as root.
+    #
+    attr_accessor :allow_root
+    alias_method :allow_root?, :allow_root
+
     # @return [Bool] Whether a message should be printed when a new version of
     #         CocoaPods is available.
     #
@@ -158,7 +163,7 @@ module Pod
     #
     def installation_root
       @installation_root ||= begin
-        current_dir = Pathname.new(ActiveSupport::Multibyte::Unicode.normalize(Dir.pwd))
+        current_dir = Pathname.new(Dir.pwd.unicode_normalize(:nfkc))
         current_path = current_dir
         until current_path.root?
           if podfile_path_in_dir(current_path)
@@ -307,11 +312,23 @@ module Pod
     def podfile_path_in_dir(dir)
       PODFILE_NAMES.each do |filename|
         candidate = dir + filename
-        if candidate.exist?
+        if candidate.file?
           return candidate
         end
       end
       nil
+    end
+
+    # Excludes the given dir from Time Machine backups.
+    #
+    # @param  [Pathname] dir
+    #         The directory to exclude from Time Machine backups.
+    #
+    # @return [void]
+    #
+    def exclude_from_backup(dir)
+      return if Gem.win_platform?
+      system('tmutil', 'addexclusion', dir.to_s, %i(out err) => File::NULL)
     end
 
     public

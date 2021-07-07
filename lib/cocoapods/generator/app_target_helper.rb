@@ -9,7 +9,7 @@ module Pod
       # @param  [Project] project
       #         the Xcodeproj to generate the target into.
       #
-      # @param  [Symbol] platform
+      # @param  [Symbol] platform_name
       #         the platform of the target. Can be `:ios` or `:osx`, etc.
       #
       # @param  [String] deployment_target
@@ -18,10 +18,14 @@ module Pod
       # @param  [String] name
       #         The name to use for the target, defaults to 'App'.
       #
+      # @param  [String] product_basename
+      #         The product basename to use for the target, defaults to `name`.
+      #
       # @return [PBXNativeTarget] the new target that was created.
       #
-      def self.add_app_target(project, platform, deployment_target, name = 'App')
-        project.new_target(:application, name, platform, deployment_target)
+      def self.add_app_target(project, platform_name, deployment_target, name = 'App', product_basename = nil)
+        project.new_target(:application, name, platform_name, deployment_target, nil,
+                           nil, product_basename)
       end
 
       # Creates and links an import file for the given pod target and into the given native target.
@@ -127,9 +131,17 @@ module Pod
       # @return [void]
       #
       def self.add_xctest_search_paths(target)
+        requires_libs = target.platform_name == :ios &&
+          Version.new(target.deployment_target) < Version.new('12.2')
+
         target.build_configurations.each do |configuration|
-          search_paths = configuration.build_settings['FRAMEWORK_SEARCH_PATHS'] ||= '$(inherited)'
-          search_paths << ' "$(PLATFORM_DIR)/Developer/Library/Frameworks"'
+          framework_search_paths = configuration.build_settings['FRAMEWORK_SEARCH_PATHS'] ||= '$(inherited)'
+          framework_search_paths << ' "$(PLATFORM_DIR)/Developer/Library/Frameworks"'
+
+          if requires_libs
+            library_search_paths = configuration.build_settings['LIBRARY_SEARCH_PATHS'] ||= '$(inherited)'
+            library_search_paths << ' "$(PLATFORM_DIR)/Developer/usr/lib"'
+          end
         end
       end
 

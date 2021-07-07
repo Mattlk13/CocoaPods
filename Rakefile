@@ -172,6 +172,15 @@ begin
 
         unless ENV['CI'].nil?
           title 'Running Danger'
+          # The obfuscated token is hard-coded into the repo because GitHub's Actions have no option to make a secret
+          # available to PRs from forks. This token belongs to @CocoaPodsBarista and has no permissions except posting
+          # comments. The reason it is needed is to inform the PR author of things Danger has suggestions for.
+          ENV['DANGER_GITHUB_API_TOKEN'] = [:d, 2, :c, :e, 4,
+                                            6, 5, :d, 3, :c, :b, 3, 3,
+                                            :b, 6, 4, 4, 8, 2, 3, 2, :f,
+                                            1, 8, :d, 8, :a, 5, 1, 6,
+                                            5, 4, 4, 2, :c, :e, 3,
+                                            :b, 0, :b].map(&:to_s).join
           Rake::Task['danger'].invoke
         end
       end
@@ -295,6 +304,8 @@ begin
 
             project = Xcodeproj::Project.open(project_path)
             target = project.targets.first
+            scheme_target = project.targets.find { |t| t.name == scheme_name }
+            target = scheme_target unless scheme_target.nil?
 
             xcodebuild_args = %W(
               xcodebuild -workspace #{workspace_path} -scheme #{scheme_name} clean #{build_action}
@@ -304,8 +315,10 @@ begin
             when :osx
               execute_command(*xcodebuild_args)
             when :ios
-              xcodebuild_args.concat ['ONLY_ACTIVE_ARCH=NO', '-destination', 'platform=iOS Simulator,name=iPhone Xs']
+              xcodebuild_args.concat ['ONLY_ACTIVE_ARCH=NO', '-destination', 'platform=iOS Simulator,name=iPhone 11 Pro']
               execute_command(*xcodebuild_args)
+            when :watchos
+              xcodebuild_args.concat ['ONLY_ACTIVE_ARCH=NO', '-destination', 'platform=watchOS Simulator,name=Apple Watch Series 5 - 40mm']
             else
               raise "Unknown platform #{platform}"
             end

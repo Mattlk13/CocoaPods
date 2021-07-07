@@ -39,6 +39,7 @@ module Pod
     #         the platforms to lint.
     #
     def initialize(spec_or_path, source_urls, platforms = [])
+      @use_frameworks = true
       @linter = Specification::Linter.new(spec_or_path)
       @source_urls = if @linter.spec && @linter.spec.dependencies.empty? && @linter.spec.recursive_subspecs.all? { |s| s.dependencies.empty? }
                        []
@@ -57,6 +58,7 @@ module Pod
         end
         result
       end
+      @use_frameworks = true
     end
 
     #-------------------------------------------------------------------------#
@@ -116,7 +118,7 @@ module Pod
       # Replace default spec with a subspec if asked for
       a_spec = spec
       if spec && @only_subspec
-        subspec_name = @only_subspec.start_with?(spec.root.name) ? @only_subspec : "#{spec.root.name}/#{@only_subspec}"
+        subspec_name = @only_subspec.start_with?("#{spec.root.name}/") ? @only_subspec : "#{spec.root.name}/#{@only_subspec}"
         a_spec = spec.subspec_by_name(subspec_name, true, true)
         @subspec_name = a_spec.name
       end
@@ -239,6 +241,10 @@ module Pod
     #
     attr_accessor :skip_tests
 
+    # @return [Array<String>] List of test_specs to run. If nil, all tests are run (unless skip_tests is specified).
+    #
+    attr_accessor :test_specs
+
     # @return [Bool] Whether the validator should run Xcode Static Analysis.
     #
     attr_accessor :analyze
@@ -250,6 +256,10 @@ module Pod
     # @return [Boolean] Whether modular headers should be used for the installation.
     #
     attr_accessor :use_modular_headers
+
+    # @return [Boolean] Whether static frameworks should be used for the installation.
+    #
+    attr_accessor :use_static_frameworks
 
     # @return [Boolean] Whether attributes that affect only public sources
     #         Bool be skipped.
@@ -268,6 +278,8 @@ module Pod
 
     attr_accessor :skip_import_validation
     alias_method :skip_import_validation?, :skip_import_validation
+
+    attr_accessor :configuration
 
     #-------------------------------------------------------------------------#
 
@@ -425,8 +437,8 @@ module Pod
 
     # Performs validation of a URL
     #
-    def validate_url(url)
-      resp = Pod::HTTP.validate_url(url)
+    def validate_url(url, user_agent = nil)
+      resp = Pod::HTTP.validate_url(url, user_agent)
 
       if !resp
         warning('url', "There was a problem validating the URL #{url}.", true)
@@ -459,7 +471,7 @@ module Pod
     # Performs validations related to the `social_media_url` attribute.
     #
     def validate_social_media_url(spec)
-      validate_url(spec.social_media_url) if spec.social_media_url
+      validate_url(spec.social_media_url, 'CocoaPods') if spec.social_media_url
     end
 
     # Performs validations related to the `documentation_url` attribute.
@@ -544,6 +556,8 @@ module Pod
       validation_dir.rmtree
     end
 
+    # @return [String] The deployment targret of the library spec.
+    #
     def deployment_target
       deployment_target = spec.subspec_by_name(subspec_name).deployment_target(consumer.platform_name)
       if consumer.platform_name == :ios && use_frameworks
@@ -555,12 +569,12 @@ module Pod
 
     def download_pod
       test_spec_names = consumer.spec.test_specs.select { |ts| ts.supported_on_platform?(consumer.platform_name) }.map(&:name)
-      podfile = podfile_from_spec(consumer.platform_name, deployment_target, use_frameworks, test_spec_names, use_modular_headers)
+      podfile = podfile_from_spec(consumer.platform_name, deployment_target, use_frameworks, test_spec_names, use_modular_headers, use_static_frameworks)
       sandbox = Sandbox.new(config.sandbox_root)
       @installer = Installer.new(sandbox, podfile)
       @installer.use_default_plugins = false
       @installer.has_dependencies = !spec.dependencies.empty?
-      %i(prepare resolve_dependencies download_dependencies).each { |m| @installer.send(m) }
+      %i(prepare resolve_dependencies download_dependencies write_lockfiles).each { |m| @installer.send(m) }
       @file_accessor = @installer.pod_targets.flat_map(&:file_accessors).find { |fa| fa.spec.name == consumer.spec.name }
     end
 
@@ -582,7 +596,7 @@ module Pod
       app_target = app_project.targets.first
       pod_target = validation_pod_target
       Pod::Generator::AppTargetHelper.add_app_project_import(app_project, app_target, pod_target, consumer.platform_name)
-      Pod::Generator::AppTargetHelper.add_xctest_search_paths(app_target) if @installer.pod_targets.any? { |pt| pt.spec_consumers.any? { |c| c.frameworks.include?('XCTest') } }
+      Pod::Generator::AppTargetHelper.add_xctest_search_paths(app_target) if @installer.pod_targets.any? { |pt| pt.spec_consumers.any? { |c| c.frameworks.include?('XCTest') || c.weak_frameworks.include?('XCTest') } }
       Pod::Generator::AppTargetHelper.add_empty_swift_file(app_project, app_target) if @installer.pod_targets.any?(&:uses_swift?)
       app_project.save
       Xcodeproj::XCScheme.share_scheme(app_project.path, 'App')
@@ -698,8 +712,9 @@ module Pod
           if scheme.nil?
             UI.warn "Skipping compilation with `xcodebuild` because target contains no sources.\n".yellow
           else
+            requested_configuration = configuration ? configuration : 'Release'
             if analyze
-              output = xcodebuild('analyze', scheme, 'Release')
+              output = xcodebuild('analyze', scheme, requested_configuration, :deployment_target => deployment_target)
               find_output = Executable.execute_command('find', [validation_dir, '-name', '*.html'], false)
               if find_output != ''
                 message = 'Static Analysis failed.'
@@ -708,7 +723,7 @@ module Pod
                 error('build_pod', message)
               end
             else
-              output = xcodebuild('build', scheme, 'Release')
+              output = xcodebuild('build', scheme, requested_configuration, :deployment_target => deployment_target)
             end
             parsed_output = parse_xcodebuild_output(output)
             translate_output_to_linter_messages(parsed_output)
@@ -730,12 +745,22 @@ module Pod
       else
         UI.message "\nTesting with `xcodebuild`.\n".yellow do
           pod_target = validation_pod_target
-          consumer.spec.test_specs.each do |test_spec|
+          all_test_specs = consumer.spec.test_specs
+          unless test_specs.nil?
+            test_spec_names = all_test_specs.map(&:base_name)
+            all_test_specs.select! { |test_spec| test_specs.include? test_spec.base_name }
+            test_specs.each do |test_spec|
+              unless test_spec_names.include? test_spec
+                UI.warn "Requested test spec `#{test_spec}` does not exist in the podspec. Existing test specs are `#{test_spec_names}`"
+              end
+            end
+          end
+          all_test_specs.each do |test_spec|
             if !test_spec.supported_on_platform?(consumer.platform_name)
               UI.warn "Skipping test spec `#{test_spec.name}` on platform `#{consumer.platform_name}` since it is not supported.\n".yellow
             else
               scheme = @installer.target_installation_results.first[pod_target.name].native_target_for_spec(test_spec)
-              output = xcodebuild('test', scheme, 'Debug')
+              output = xcodebuild('test', scheme, 'Debug', :deployment_target => test_spec.deployment_target(consumer.platform_name))
               parsed_output = parse_xcodebuild_output(output)
               translate_output_to_linter_messages(parsed_output)
             end
@@ -951,7 +976,7 @@ module Pod
     # @note   The generated podfile takes into account whether the linter is
     #         in local mode.
     #
-    def podfile_from_spec(platform_name, deployment_target, use_frameworks = true, test_spec_names = [], use_modular_headers = false)
+    def podfile_from_spec(platform_name, deployment_target, use_frameworks = true, test_spec_names = [], use_modular_headers = false, use_static_frameworks = false)
       name     = subspec_name || spec.name
       podspec  = file.realpath
       local    = local?
@@ -961,12 +986,16 @@ module Pod
       additional_path_pods = (include_podspecs ? Dir.glob(include_podspecs) : []) .select { |path| spec.name != Specification.from_file(path).name } - additional_podspec_pods
 
       Pod::Podfile.new do
-        install! 'cocoapods', :deterministic_uuids => false
+        install! 'cocoapods', :deterministic_uuids => false, :warn_for_unused_master_specs_repo => false
         # By default inhibit warnings for all pods, except the one being validated.
         inhibit_all_warnings!
         urls.each { |u| source(u) }
         target 'App' do
-          use_frameworks!(use_frameworks)
+          if use_static_frameworks
+            use_frameworks!(:linkage => :static)
+          else
+            use_frameworks!(use_frameworks)
+          end
           use_modular_headers! if use_modular_headers
           platform(platform_name, deployment_target)
           if local
@@ -1014,7 +1043,7 @@ module Pod
           l.include?('note: ') && (l !~ /expanded from macro/)
       end
       selected_lines.map do |l|
-        new = l.gsub(%r{#{validation_dir}/Pods/}, '')
+        new = l.force_encoding('UTF-8').gsub(%r{#{validation_dir}/Pods/}, '')
         new.gsub!(/^ */, ' ')
       end
     end
@@ -1022,7 +1051,7 @@ module Pod
     # @return [String] Executes xcodebuild in the current working directory and
     #         returns its output (both STDOUT and STDERR).
     #
-    def xcodebuild(action, scheme, configuration)
+    def xcodebuild(action, scheme, configuration, deployment_target:)
       require 'fourflusher'
       command = %W(clean #{action} -workspace #{File.join(validation_dir, 'App.xcworkspace')} -scheme #{scheme} -configuration #{configuration})
       case consumer.platform_name

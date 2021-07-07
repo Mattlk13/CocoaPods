@@ -1,4 +1,5 @@
-require 'cocoapods/target/framework_paths'
+require 'cocoapods/xcode/framework_paths'
+require 'cocoapods/xcode/xcframework'
 
 module Pod
   # Stores the information relative to the target used to cluster the targets
@@ -56,7 +57,7 @@ module Pod
     # Initialize a new instance
     #
     # @param [Sandbox] sandbox @see Target#sandbox
-    # @param [Boolean] host_requires_frameworks @see Target#host_requires_frameworks
+    # @param [BuildType] build_type @see Target#build_type
     # @param [Hash{String=>Symbol}] user_build_configurations @see Target#user_build_configurations
     # @param [Array<String>] archs @see Target#archs
     # @param [Platform] platform @see #Target#platform
@@ -65,12 +66,10 @@ module Pod
     # @param [Xcodeproj::Project] user_project @see #user_project
     # @param [Array<String>] user_target_uuids @see #user_target_uuids
     # @param [Hash{String=>Array<PodTarget>}] pod_targets_for_build_configuration @see #pod_targets_for_build_configuration
-    # @param [Target::BuildType] build_type @see #build_type
     #
-    def initialize(sandbox, host_requires_frameworks, user_build_configurations, archs, platform, target_definition,
-                   client_root, user_project, user_target_uuids, pod_targets_for_build_configuration,
-                   build_type: Target::BuildType.infer_from_spec(nil, :host_requires_frameworks => host_requires_frameworks))
-      super(sandbox, host_requires_frameworks, user_build_configurations, archs, platform, :build_type => build_type)
+    def initialize(sandbox, build_type, user_build_configurations, archs, platform, target_definition, client_root,
+                   user_project, user_target_uuids, pod_targets_for_build_configuration)
+      super(sandbox, build_type, user_build_configurations, archs, platform)
       raise "Can't initialize an AggregateTarget without a TargetDefinition!" if target_definition.nil?
       raise "Can't initialize an AggregateTarget with an abstract TargetDefinition!" if target_definition.abstract?
       @target_definition = target_definition
@@ -95,9 +94,11 @@ module Pod
       merged = @pod_targets_for_build_configuration.merge(embedded_pod_targets_for_build_configuration) do |_, before, after|
         (before + after).uniq
       end
-      AggregateTarget.new(sandbox, host_requires_frameworks, user_build_configurations, archs, platform,
-                          target_definition, client_root, user_project, user_target_uuids, merged, :build_type => build_type).tap do |aggregate_target|
+      AggregateTarget.new(sandbox, build_type, user_build_configurations, archs, platform,
+                          target_definition, client_root, user_project, user_target_uuids, merged).tap do |aggregate_target|
         aggregate_target.search_paths_aggregate_targets.concat(search_paths_aggregate_targets).freeze
+        aggregate_target.mark_application_extension_api_only if application_extension_api_only
+        aggregate_target.mark_build_library_for_distribution if build_library_for_distribution
       end
     end
 
@@ -221,14 +222,21 @@ module Pod
     # @return [Boolean] Whether the target contains any resources
     #
     def includes_resources?
-      !resource_paths_by_config.values.all?(&:empty?)
+      !resource_paths_by_config.each_value.all?(&:empty?)
     end
 
-    # @return [Boolean] Whether the target contains framework to be embedded into
+    # @return [Boolean] Whether the target contains frameworks to be embedded into
     #         the user target
     #
     def includes_frameworks?
-      !framework_paths_by_config.values.all?(&:empty?)
+      !framework_paths_by_config.each_value.all?(&:empty?)
+    end
+
+    # @return [Boolean] Whether the target contains xcframeworks to be embedded into
+    #         the user target
+    #
+    def includes_xcframeworks?
+      !xcframeworks_by_config.each_value.all?(&:empty?)
     end
 
     # @return [Hash{String => Array<FrameworkPaths>}] The vendored dynamic artifacts and framework target
@@ -248,6 +256,23 @@ module Pod
       end
     end
 
+    # @return [Hash{String => Array<Xcode::XCFramework>}] The vendored dynamic artifacts and framework target
+    #         input and output paths grouped by config
+    #
+    def xcframeworks_by_config
+      @xcframeworks_by_config ||= begin
+        xcframeworks_by_config = {}
+        user_build_configurations.each_key do |config|
+          relevant_pod_targets = pod_targets_for_build_configuration(config)
+          xcframeworks_by_config[config] = relevant_pod_targets.flat_map do |pod_target|
+            library_specs = pod_target.library_specs.map(&:name)
+            pod_target.xcframeworks.values_at(*library_specs).flatten.compact.uniq
+          end
+        end
+        xcframeworks_by_config
+      end
+    end
+
     # @return [Hash{String => Array<String>}] Uniqued Resources grouped by config
     #
     def resource_paths_by_config
@@ -260,6 +285,20 @@ module Pod
           resources_by_config[config] = targets.flat_map do |pod_target|
             library_specs = pod_target.library_specs.map(&:name)
             resource_paths = pod_target.resource_paths.values_at(*library_specs).flatten
+
+            if pod_target.build_as_static_framework?
+              built_product_dir = Pathname.new(pod_target.build_product_path('${BUILT_PRODUCTS_DIR}'))
+              resource_paths = resource_paths.map do |resource_path|
+                extname = File.extname(resource_path)
+                if self.class.resource_extension_compilable?(extname)
+                  output_extname = self.class.output_extension_for_resource(extname)
+                  built_product_dir.join(File.basename(resource_path)).sub_ext(output_extname).to_s
+                else
+                  resource_path
+                end
+              end
+            end
+
             resource_paths << bridge_support_file
             resource_paths.compact.uniq
           end
@@ -293,6 +332,12 @@ module Pod
       support_files_dir + "#{label}-resources.sh"
     end
 
+    # @return [Pathname] The absolute path of the embed frameworks script.
+    #
+    def embed_frameworks_script_path
+      support_files_dir + "#{label}-frameworks.sh"
+    end
+
     # @param  [String] configuration the configuration this path is for.
     #
     # @return [Pathname] The absolute path of the copy resources script input file list.
@@ -309,12 +354,6 @@ module Pod
       support_files_dir + "#{label}-resources-#{configuration}-output-files.xcfilelist"
     end
 
-    # @return [Pathname] The absolute path of the embed frameworks script.
-    #
-    def embed_frameworks_script_path
-      support_files_dir + "#{label}-frameworks.sh"
-    end
-
     # @param  [String] configuration the configuration this path is for.
     #
     # @return [Pathname] The absolute path of the embed frameworks script input file list.
@@ -329,6 +368,30 @@ module Pod
     #
     def embed_frameworks_script_output_files_path(configuration)
       support_files_dir + "#{label}-frameworks-#{configuration}-output-files.xcfilelist"
+    end
+
+    # @param  [String] configuration the configuration this path is for.
+    #
+    # @return [Pathname] The absolute path of the prepare artifacts script input file list.
+    #
+    # @deprecated
+    #
+    # @todo Remove in 2.0
+    #
+    def prepare_artifacts_script_input_files_path(configuration)
+      support_files_dir + "#{label}-artifacts-#{configuration}-input-files.xcfilelist"
+    end
+
+    # @param  [String] configuration the configuration this path is for.
+    #
+    # @return [Pathname] The absolute path of the prepare artifacts script output file list.
+    #
+    # @deprecated
+    #
+    # @todo Remove in 2.0
+    #
+    def prepare_artifacts_script_output_files_path(configuration)
+      support_files_dir + "#{label}-artifacts-#{configuration}-output-files.xcfilelist"
     end
 
     # @return [String] The output file path fo the check manifest lock script.
@@ -410,6 +473,39 @@ module Pod
       "${PODS_ROOT}/#{relative_to_pods_root(embed_frameworks_script_output_files_path('${CONFIGURATION}'))}"
     end
 
+    # @return [String] The path of the prepare artifacts script relative to the
+    #         root of the Pods project.
+    #
+    # @deprecated
+    #
+    # @todo Remove in 2.0
+    #
+    def prepare_artifacts_script_relative_path
+      "${PODS_ROOT}/#{relative_to_pods_root(prepare_artifacts_script_path)}"
+    end
+
+    # @return [String] The path of the prepare artifacts script input file list
+    #         relative to the root of the Pods project.
+    #
+    # @deprecated
+    #
+    # @todo Remove in 2.0
+    #
+    def prepare_artifacts_script_input_files_relative_path
+      "${PODS_ROOT}/#{relative_to_pods_root(prepare_artifacts_script_input_files_path('${CONFIGURATION}'))}"
+    end
+
+    # @return [String] The path of the prepare artifacts script output file list
+    #         relative to the root of the Pods project.
+    #
+    # @deprecated
+    #
+    # @todo Remove in 2.0
+    #
+    def prepare_artifacts_script_output_files_relative_path
+      "${PODS_ROOT}/#{relative_to_pods_root(prepare_artifacts_script_output_files_path('${CONFIGURATION}'))}"
+    end
+
     private
 
     # @!group Private Helpers
@@ -430,8 +526,8 @@ module Pod
     def create_build_settings
       settings = {}
 
-      user_build_configurations.each_key do |configuration_name|
-        settings[configuration_name] = BuildSettings::AggregateTargetSettings.new(self, configuration_name)
+      user_build_configurations.each do |configuration_name, configuration|
+        settings[configuration_name] = BuildSettings::AggregateTargetSettings.new(self, configuration_name, :configuration => configuration)
       end
 
       settings

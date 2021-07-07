@@ -1,6 +1,9 @@
 require 'cocoapods-core/source'
+require 'cocoapods/open-uri'
+require 'netrc'
 require 'set'
 require 'rest'
+require 'yaml'
 
 module Pod
   class Source
@@ -68,8 +71,20 @@ module Pod
       #         The URL of the source.
       #
       def cdn_url?(url)
-        url =~ %r{^https:\/\/} &&
-          REST.head(url + '/all_pods.txt').ok?
+        return unless url =~ %r{^https?:\/\/}
+
+        uri_options = {}
+
+        netrc_info = Netrc.read
+        netrc_host = URI.parse(url).host
+        credentials = netrc_info[netrc_host]
+        uri_options[:http_basic_authentication] = credentials if credentials
+
+        response = OpenURI.open_uri(url.chomp('/') + '/CocoaPods-version.yml', uri_options)
+        response_hash = YAML.load(response.read) # rubocop:disable Security/YAMLLoad
+        response_hash.is_a?(Hash) && !Source::Metadata.new(response_hash).latest_cocoapods_version.nil?
+      rescue ::OpenURI::HTTPError, SocketError
+        return false
       rescue => e
         raise Informative, "Couldn't determine repo type for URL: `#{url}`: #{e}"
       end
@@ -107,15 +122,19 @@ module Pod
       #
       def update(source_name = nil, show_output = false)
         if source_name
-          sources = [git_source_named(source_name)]
+          sources = [updateable_source_named(source_name)]
         else
-          sources = git_sources
+          sources = updateable_sources
         end
 
         changed_spec_paths = {}
-        # Ceate the Spec_Lock file if needed and lock it so that concurrent
+
+        # Do not perform an update if the repos dir has not been setup yet.
+        return unless repos_dir.exist?
+
+        # Create the Spec_Lock file if needed and lock it so that concurrent
         # repo updates do not cause each other to fail
-        File.open("#{Config.instance.repos_dir}/Spec_Lock", File::CREAT) do |f|
+        File.open("#{repos_dir}/Spec_Lock", File::CREAT) do |f|
           f.flock(File::LOCK_EX)
           sources.each do |source|
             UI.section "Updating spec repo `#{source.name}`" do

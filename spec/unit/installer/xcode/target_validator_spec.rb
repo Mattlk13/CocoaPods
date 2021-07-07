@@ -79,7 +79,7 @@ module Pod
 
           it 'allows duplicate references to the same expanded framework path' do
             Sandbox::FileAccessor.any_instance.stubs(:vendored_frameworks).returns([fixture('monkey/dynamic-monkey.framework')])
-            Sandbox::FileAccessor.any_instance.stubs(:dynamic_binary?).returns(true)
+            Pod::Xcode::LinkageAnalyzer.stubs(:dynamic_binary?).returns(true)
             fixture_path = ROOT + 'spec/fixtures'
             config.repos_dir = fixture_path + 'spec-repos'
             podfile = Pod::Podfile.new do
@@ -229,7 +229,7 @@ module Pod
           end
 
           it 'allows transitive static dependencies when building a static framework' do
-            PodTarget.any_instance.stubs(:build_type => Target::BuildType.static_framework)
+            PodTarget.any_instance.stubs(:build_type => BuildType.static_framework)
             Sandbox::FileAccessor.any_instance.stubs(:vendored_libraries).returns([@lib_thing])
             @validator = create_validator(config.sandbox, @podfile, @lockfile)
             should.not.raise(Informative) { @validator.validate! }
@@ -381,7 +381,9 @@ module Pod
             podfile.target_definition_list.find { |td| td.name == 'SampleProject' }.swift_version = '3.0'
             podfile.target_definition_list.find { |td| td.name == 'TestRunner' }.swift_version = '2.3'
             @validator.pod_targets.find { |pt| pt.name == 'OrangeFramework' }.stubs(:spec_swift_versions).returns(['4.0'])
+            @validator.pod_targets.find { |pt| pt.name == 'OrangeFramework' }.stubs(:swift_version).returns('4.0')
             @validator.pod_targets.find { |pt| pt.name == 'matryoshka' }.stubs(:spec_swift_versions).returns(['3.2'])
+            @validator.pod_targets.find { |pt| pt.name == 'matryoshka' }.stubs(:swift_version).returns('3.2')
             lambda { @validator.validate! }.should.not.raise
           end
 
@@ -406,6 +408,50 @@ module Pod
             e.message.should.match /Unable to determine Swift version for the following pods:/
             e.message.should.include 'MultiSwift` does not specify a Swift version (`3.2` and `4.0`) that is satisfied by ' \
               'any of targets (`SampleProject` and `TestRunner`) integrating it.'
+          end
+
+          it 'does not crash on swift version check with deduplicate_targets' do
+            fixture_path = ROOT + 'spec/fixtures'
+            config.repos_dir = fixture_path + 'spec-repos'
+            podfile = Podfile.new do
+              project(fixture_path + 'SampleProject/SampleProject').to_s
+              platform :ios, '10.0'
+              install! 'cocoapods', :integrate_targets => false, :deduplicate_targets => false
+              pod 'MultiSwift', :path => (fixture_path + 'multi-swift').to_s
+              supports_swift_versions '< 3.0'
+              target 'SampleProject'
+              target 'TestRunner'
+            end
+            lockfile = generate_lockfile
+
+            @validator = create_validator(config.sandbox, podfile, lockfile)
+            e = should.raise Informative do
+              @validator.validate!
+            end
+            e.message.should.match /Unable to determine Swift version for the following pods:/
+            e.message.should.include 'MultiSwift-Pods-SampleProject` does not specify a Swift version (`3.2` and `4.0`) that is satisfied by ' \
+             'any of targets (`SampleProject`) integrating it.'
+            e.message.should.include 'MultiSwift-Pods-TestRunner` does not specify a Swift version (`3.2` and `4.0`) that is satisfied by ' \
+             'any of targets (`TestRunner`) integrating it.'
+          end
+
+          it 'does not crash if targets are missing' do
+            fixture_path = ROOT + 'spec/fixtures'
+            config.repos_dir = fixture_path + 'spec-repos'
+            podfile = Podfile.new do
+              project(fixture_path + 'SampleProject/SampleProject').to_s
+              platform :ios, '10.0'
+              install! 'cocoapods', :integrate_targets => false
+            end
+            lockfile = generate_lockfile
+
+            @validator = create_validator(config.sandbox, podfile, lockfile)
+            @validator.stubs(:pod_targets).returns([stub('MultiSwift',
+                                                         :uses_swift? => true,
+                                                         :swift_version => nil,
+                                                         :dependent_targets => [],
+                                                         :spec_swift_versions => ['4.0'])])
+            lambda { @validator.validate! }.should.not.raise
           end
 
           it 'does not raise an error if a pods swift versions are satisfied by the targets requirements' do
@@ -444,6 +490,7 @@ module Pod
 
             @validator = create_validator(config.sandbox, podfile, lockfile)
             @validator.pod_targets.find { |pt| pt.name == 'OrangeFramework' }.stubs(:spec_swift_versions).returns(['4.0'])
+            @validator.pod_targets.find { |pt| pt.name == 'OrangeFramework' }.stubs(:swift_version).returns('4.0')
             e = lambda { @validator.validate! }.should.raise Informative
             e.message.should.include <<-EOS.strip_heredoc.strip
               [!] The following Swift pods cannot yet be integrated as static libraries:

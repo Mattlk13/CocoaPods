@@ -22,6 +22,10 @@ module Pod
         #
         attr_reader :project_object_version
 
+        # @return [Hash<String, Hash>] The podfile plugins to be run for the installation.
+        #
+        attr_reader :podfile_plugins
+
         # @return [Array<PodTarget>] The list of pod targets.
         #
         attr_reader :pod_targets
@@ -29,6 +33,10 @@ module Pod
         # @return [Array<AggregateTarget>] The list of aggregate targets.
         #
         attr_reader :aggregate_targets
+
+        # @return [Hash<Symbol, Object>] Hash of installation options.
+        #
+        attr_reader :installation_options
 
         # @return [Bool] Flag indicating if we want to ignore the cache and force a clean installation.
         #
@@ -40,18 +48,22 @@ module Pod
         # @param [ProjectInstallationCache] cache @see #cache
         # @param [Hash{String => Symbol}] build_configurations @see #build_configurations
         # @param [Integer] project_object_version @see #project_object_version
+        # @param [Hash<String, Hash>] podfile_plugins @see #podfile_plugins
         # @param [Array<PodTarget>] pod_targets @see #pod_targets
         # @param [Array<AggregateTarget>] aggregate_targets @see #aggregate_targets
+        # @param [Hash<Symbol, Object>] installation_options @see #installation_options
         # @param [Bool] clean_install @see #clean_install
         #
-        def initialize(sandbox, cache, build_configurations, project_object_version, pod_targets, aggregate_targets,
+        def initialize(sandbox, cache, build_configurations, project_object_version, podfile_plugins, pod_targets, aggregate_targets, installation_options,
                        clean_install: false)
           @sandbox = sandbox
           @cache = cache
           @build_configurations = build_configurations
+          @podfile_plugins = podfile_plugins
           @pod_targets = pod_targets
           @aggregate_targets = aggregate_targets
           @project_object_version = project_object_version
+          @installation_options = installation_options
           @clean_install = clean_install
         end
 
@@ -70,7 +82,10 @@ module Pod
           end
 
           # Bail out early since these properties affect all targets and their associate projects.
-          if cache.build_configurations != build_configurations || cache.project_object_version != project_object_version
+          if cache.build_configurations != build_configurations ||
+              cache.project_object_version != project_object_version ||
+              YAMLHelper.convert(cache.podfile_plugins) != YAMLHelper.convert(podfile_plugins) ||
+              YAMLHelper.convert(cache.installation_options) != YAMLHelper.convert(installation_options)
             UI.message 'Ignoring project cache due to project configuration changes.'
             return full_install_results
           end

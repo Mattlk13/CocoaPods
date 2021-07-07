@@ -51,9 +51,12 @@ module Pod
               return :project if (other.key_hash.keys - key_hash.keys).any?
               return :project if other.key_hash['CHECKSUM'] != key_hash['CHECKSUM']
               return :project if other.key_hash['SPECS'] != key_hash['SPECS']
-              return :project if other.key_hash['FILES'] != key_hash['FILES']
               return :project if other.key_hash['PROJECT_NAME'] != key_hash['PROJECT_NAME']
             end
+
+            this_files = key_hash['FILES']
+            other_files = other.key_hash['FILES']
+            return :project if this_files != other_files
 
             this_build_settings = key_hash['BUILD_SETTINGS_CHECKSUM']
             other_build_settings = other.key_hash['BUILD_SETTINGS_CHECKSUM']
@@ -116,12 +119,14 @@ module Pod
         #
         def self.from_pod_target(sandbox, pod_target, is_local_pod: false, checkout_options: nil)
           build_settings = {}
-          build_settings[pod_target.label.to_s] = Digest::MD5.hexdigest(pod_target.build_settings.xcconfig.to_s)
-          pod_target.test_spec_build_settings.each do |name, settings|
-            build_settings[name] = Digest::MD5.hexdigest(settings.xcconfig.to_s)
+          build_settings[pod_target.label.to_s] = Hash[pod_target.build_settings.map do |k, v|
+            [k, Digest::MD5.hexdigest(v.xcconfig.to_s)]
+          end]
+          pod_target.test_spec_build_settings_by_config.each do |name, settings_by_config|
+            build_settings[name] = Hash[settings_by_config.map { |k, v| [k, Digest::MD5.hexdigest(v.xcconfig.to_s)] }]
           end
-          pod_target.app_spec_build_settings.each do |name, settings|
-            build_settings[name] = Digest::MD5.hexdigest(settings.xcconfig.to_s)
+          pod_target.app_spec_build_settings_by_config.each do |name, settings_by_config|
+            build_settings[name] = Hash[settings_by_config.map { |k, v| [k, Digest::MD5.hexdigest(v.xcconfig.to_s)] }]
           end
 
           contents = {
@@ -131,7 +136,7 @@ module Pod
             'PROJECT_NAME' => pod_target.project_name,
           }
           if is_local_pod
-            relative_file_paths = pod_target.all_files.map { |f| Pathname.new(f).relative_path_from(sandbox.root).to_s }
+            relative_file_paths = pod_target.all_files.map { |f| f.relative_path_from(sandbox.root).to_s }
             contents['FILES'] = relative_file_paths.sort_by(&:downcase)
           end
           contents['CHECKOUT_OPTIONS'] = checkout_options if checkout_options
@@ -153,7 +158,14 @@ module Pod
             build_settings[configuration] = Digest::MD5.hexdigest(aggregate_target.build_settings(configuration).xcconfig.to_s)
           end
 
-          TargetCacheKey.new(sandbox, :aggregate, 'BUILD_SETTINGS_CHECKSUM' => build_settings)
+          contents = {
+            'BUILD_SETTINGS_CHECKSUM' => build_settings,
+          }
+          if aggregate_target.includes_resources?
+            relative_file_paths = aggregate_target.resource_paths_by_config.values.flatten.uniq
+            contents['FILES'] = relative_file_paths.sort_by(&:downcase)
+          end
+          TargetCacheKey.new(sandbox, :aggregate, contents)
         end
       end
     end

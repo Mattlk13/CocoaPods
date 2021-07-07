@@ -1,7 +1,5 @@
 require File.expand_path('../../spec_helper', __FILE__)
 
-require 'cocoapods_stats/sender'
-
 # @return [Lockfile]
 #
 def generate_lockfile(lockfile_version: Pod::VERSION)
@@ -49,7 +47,6 @@ end
 module Pod
   describe Installer do
     before do
-      CocoaPodsStats::Sender.any_instance.stubs(:send)
       podfile = generate_podfile
       lockfile = generate_lockfile
       @installer = Installer.new(config.sandbox, podfile, lockfile)
@@ -71,7 +68,12 @@ module Pod
         @installer.stubs(:perform_post_install_actions)
         @installer.stubs(:predictabilize_uuids)
         @installer.stubs(:stabilize_target_uuids)
-
+        podfile_dependency_cache = Installer::Analyzer::PodfileDependencyCache.from_podfile(@installer.podfile)
+        @analysis_result = Installer::Analyzer::AnalysisResult.new(Pod::Installer::Analyzer::SpecsState.new, {}, {},
+                                                                   [fixture_spec('banana-lib/BananaLib.podspec')],
+                                                                   Pod::Installer::Analyzer::SpecsState.new, [], [],
+                                                                   podfile_dependency_cache)
+        @installer.stubs(:analysis_result).returns(@analysis_result)
         Installer::Xcode::PodsProjectGenerator.any_instance.stubs(:configure_schemes)
         Installer::Xcode::SinglePodsProjectGenerator.any_instance.stubs(:generate!)
         Installer::Xcode::PodsProjectWriter.any_instance.stubs(:write!)
@@ -106,10 +108,11 @@ module Pod
         generator_result = Installer::Xcode::PodsProjectGenerator::PodsProjectGeneratorResult.new(nil, {}, target_installation_results)
         generator.stubs(:generate!).returns(generator_result)
         generator.stubs(:configure_schemes)
+        Installer::Xcode::PodsProjectWriter.any_instance.unstub(:write!)
 
         hooks = sequence('hooks')
         @installer.expects(:run_podfile_post_install_hooks).once.in_sequence(hooks)
-        Installer::Xcode::PodsProjectWriter.any_instance.expects(:write!).once.in_sequence(hooks)
+        Installer::Xcode::PodsProjectWriter.any_instance.expects(:save_projects).once.in_sequence(hooks)
 
         @installer.install!
       end
@@ -328,6 +331,13 @@ module Pod
         @installer.install!
       end
 
+      it 'always writes lockfile even if project generation and integration is false' do
+        installation_options = Pod::Installer::InstallationOptions.new(:skip_pods_project_generation => true, :integrate_targets => false)
+        @installer.stubs(:installation_options).returns(installation_options)
+        @installer.expects(:write_lockfiles)
+        @installer.install!
+      end
+
       it 'prints a list of deprecated pods' do
         spec = Spec.new
         spec.name = 'RestKit'
@@ -339,6 +349,82 @@ module Pod
         @installer.send(:warn_for_deprecations)
         UI.warnings.should.include 'deprecated in favor of AFNetworking'
         UI.warnings.should.include 'BlocksKit has been deprecated'
+      end
+
+      it 'prints a warning if the master specs repo is not explicitly used but it exists in the users repos dir' do
+        podfile = Pod::Podfile.new do
+          install! 'cocoapods', :integrate_targets => false
+          platform :ios
+        end
+        @installer = Installer.new(config.sandbox, podfile)
+        master_source = Source.new(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+        master_source.stubs(:url).returns(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+        config.sources_manager.stubs(:all).returns([master_source])
+        @installer.send(:warn_for_removing_git_master_specs_repo)
+        UI.warnings.should.include 'Your project does not explicitly specify the CocoaPods master specs repo. Since CDN is now used as the' \
+          ' default, you may safely remove it from your repos directory via `pod repo remove master`.' \
+          ' To suppress this warning please add `warn_for_unused_master_specs_repo => false` to your Podfile.'
+      end
+
+      it 'does not print a warning if the master specs repo is explicitly used' do
+        podfile = Pod::Podfile.new do
+          source Pod::Installer::MASTER_SPECS_REPO_GIT_URL
+          install! 'cocoapods', :integrate_targets => false
+          platform :ios
+        end
+        @installer = Installer.new(config.sandbox, podfile)
+        master_source = Source.new(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+        master_source.stubs(:url).returns(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+        config.sources_manager.stubs(:all).returns([master_source])
+        @installer.send(:warn_for_removing_git_master_specs_repo)
+        UI.warnings.should.be.empty
+      end
+
+      it 'does not print a warning if the master specs repo is explicitly used by a plugin' do
+        podfile = Pod::Podfile.new do
+          plugin 'my-plugin'
+          install! 'cocoapods', :integrate_targets => false
+          platform :ios
+        end
+        podfile.stubs(:plugins).returns('my-plugin' => {})
+
+        Pod::HooksManager.register('my-plugin', :source_provider) do |context, _|
+          plugin_source = Source.new(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+          plugin_source.stubs(:url).returns(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+          context.add_source(plugin_source)
+        end
+
+        @installer = Installer.new(config.sandbox, podfile)
+        @installer.stubs(:ensure_plugins_are_installed!)
+        master_source = Source.new(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+        master_source.stubs(:url).returns(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+        config.sources_manager.stubs(:all).returns([master_source])
+        @installer.send(:warn_for_removing_git_master_specs_repo)
+        UI.warnings.should.be.empty
+      end
+
+      it 'does not print a warning if the master specs repo is not explicitly used but is also not present in the users repo dir' do
+        podfile = Pod::Podfile.new do
+          install! 'cocoapods', :integrate_targets => false
+          platform :ios
+        end
+        @installer = Installer.new(config.sandbox, podfile)
+        config.sources_manager.stubs(:all).returns([])
+        @installer.send(:warn_for_removing_git_master_specs_repo)
+        UI.warnings.should.be.empty
+      end
+
+      it 'does not print a warning for removing the master specs repo if the warning is suppressed' do
+        podfile = Pod::Podfile.new do
+          install! 'cocoapods', :integrate_targets => false, :warn_for_unused_master_specs_repo => false
+          platform :ios
+        end
+        @installer = Installer.new(config.sandbox, podfile)
+        master_source = Source.new(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+        master_source.stubs(:url).returns(Pod::Installer::MASTER_SPECS_REPO_GIT_URL)
+        config.sources_manager.stubs(:all).returns([master_source])
+        @installer.send(:warn_for_removing_git_master_specs_repo)
+        UI.warnings.should.be.empty
       end
 
       it 'does not raise if command is run outside sandbox directory' do
@@ -515,7 +601,7 @@ module Pod
           @spec.stubs(:root => @spec)
           @spec.stubs(:spec_type).returns(:library)
           @spec.stubs(:module_name => 'Spec')
-          @pod_targets = [PodTarget.new(config.sandbox, false, {}, [], Platform.ios, [@spec],
+          @pod_targets = [PodTarget.new(config.sandbox, BuildType.static_library, {}, [], Platform.ios, [@spec],
                                         [fixture_target_definition], nil)]
           @installer.stubs(:analysis_result).returns(@analysis_result)
           @installer.stubs(:pod_targets).returns(@pod_targets)
@@ -560,7 +646,7 @@ module Pod
 
         it 'correctly configures the Pod source installer' do
           spec = fixture_spec('banana-lib/BananaLib.podspec')
-          pod_target = PodTarget.new(config.sandbox, false, {}, [], Platform.ios, [spec], [fixture_target_definition],
+          pod_target = PodTarget.new(config.sandbox, BuildType.static_library, {}, [], Platform.ios, [spec], [fixture_target_definition],
                                      nil)
           pod_target.stubs(:platform).returns(:ios)
           @installer.stubs(:pod_targets).returns([pod_target])
@@ -571,7 +657,7 @@ module Pod
 
         it 'maintains the list of the installed specs' do
           spec = fixture_spec('banana-lib/BananaLib.podspec')
-          pod_target = PodTarget.new(config.sandbox, false, {}, [], Platform.ios, [spec], [fixture_target_definition],
+          pod_target = PodTarget.new(config.sandbox, BuildType.static_library, {}, [], Platform.ios, [spec], [fixture_target_definition],
                                      nil)
           pod_target.stubs(:platform).returns(:ios)
           @installer.stubs(:pod_targets).returns([pod_target, pod_target])
@@ -621,6 +707,27 @@ module Pod
           @installer.send(:install_pod_sources)
           UI.output.should.not.include 'was 1.0'
           UI.output.should.not.include 'source changed'
+        end
+
+        it 'does not print the spec repo of a pod if the source is trunk when updating the spec' do
+          spec = Spec.new
+          spec.name = 'RestKit'
+          spec.version = Version.new('2.0')
+          manifest = Lockfile.new('SPEC REPOS' => { 'trunk' => ['RestKit'] })
+          manifest.stubs(:version).with('RestKit').returns(Version.new('1.0'))
+          analysis_result = Installer::Analyzer::AnalysisResult.new(Pod::Installer::Analyzer::SpecsState.new, {},
+                                                                    { TrunkSource.new(Pod::TrunkSource::TRUNK_REPO_NAME) => [spec] }, [spec],
+                                                                    Pod::Installer::Analyzer::SpecsState.new, [], [], nil)
+          @installer.stubs(:analysis_result).returns(analysis_result)
+          @installer.sandbox.stubs(:manifest).returns(manifest)
+          @installer.stubs(:root_specs).returns([spec])
+          sandbox_state = Installer::Analyzer::SpecsState.new
+          sandbox_state.changed << 'RestKit'
+          @installer.stubs(:sandbox_state).returns(sandbox_state)
+          @installer.expects(:install_source_of_pod).with('RestKit')
+          @installer.send(:install_pod_sources)
+          UI.output.should.not.include 'source changed'
+          UI.output.should.include 'was 1.0'
         end
 
         it 'prints the spec repo of a pod while updating the spec with a new source' do
@@ -675,7 +782,7 @@ module Pod
             ]
             @pod_targets = targets.map do |(name, platform, target_spec)|
               target_definition = fixture_target_definition(name, platform)
-              PodTarget.new(config.sandbox, false, {}, [], platform, [target_spec], [target_definition], nil)
+              PodTarget.new(config.sandbox, BuildType.static_library, {}, [], platform, [target_spec], [target_definition], nil)
             end
             @installer.stubs(:pod_targets).returns(@pod_targets)
             @installer.send(:specs_for_pod, 'matryoshka').should == {
@@ -695,7 +802,7 @@ module Pod
           ]
           @pod_targets = targets.map do |(name, platform, target_spec)|
             target_definition = fixture_target_definition(name, platform)
-            PodTarget.new(config.sandbox, false, {}, [], platform, [target_spec], [target_definition], nil)
+            PodTarget.new(config.sandbox, BuildType.static_library, {}, [], platform, [target_spec], [target_definition], nil)
           end
           @installer.stubs(:pod_targets).returns(@pod_targets)
           pod_installer = @installer.send(:create_pod_installer, 'matryoshka')
@@ -709,7 +816,7 @@ module Pod
 
         it 'raises when it attempts to install pod source with no target supporting it' do
           spec = fixture_spec('banana-lib/BananaLib.podspec')
-          pod_target = PodTarget.new(config.sandbox, false, {}, [], Platform.ios, [spec], [fixture_target_definition],
+          pod_target = PodTarget.new(config.sandbox, BuildType.static_library, {}, [], Platform.ios, [spec], [fixture_target_definition],
                                      nil)
           pod_target.stubs(:platform).returns(:ios)
           @installer.stubs(:pod_targets).returns([pod_target])
@@ -721,7 +828,7 @@ module Pod
         it 'prints a warning for installed pods that included script phases' do
           spec = fixture_spec('coconut-lib/CoconutLib.podspec')
           spec.test_specs.first.script_phase = { :name => 'Hello World', :script => 'echo "Hello World"' }
-          pod_target = PodTarget.new(config.sandbox, false, {}, [], Platform.ios, [spec, *spec.test_specs],
+          pod_target = PodTarget.new(config.sandbox, BuildType.static_library, {}, [], Platform.ios, [spec, *spec.test_specs],
                                      [fixture_target_definition], nil)
           pod_target.stubs(:platform).returns(:ios)
           sandbox_state = Installer::Analyzer::SpecsState.new
@@ -737,11 +844,27 @@ module Pod
         it 'does not print a warning for already installed pods that include script phases' do
           spec = fixture_spec('coconut-lib/CoconutLib.podspec')
           spec.test_specs.first.script_phase = { :name => 'Hello World', :script => 'echo "Hello World"' }
-          pod_target = PodTarget.new(config.sandbox, false, {}, [], Platform.ios, [spec, *spec.test_specs],
+          pod_target = PodTarget.new(config.sandbox, BuildType.static_library, {}, [], Platform.ios, [spec, *spec.test_specs],
                                      [fixture_target_definition], nil)
           pod_target.stubs(:platform).returns(:ios)
           sandbox_state = Installer::Analyzer::SpecsState.new
           sandbox_state.unchanged << 'CoconutLib'
+          @installer.stubs(:pod_targets).returns([pod_target])
+          @installer.stubs(:root_specs).returns([spec])
+          @installer.stubs(:sandbox_state).returns(sandbox_state)
+          @installer.send(:warn_for_installed_script_phases)
+          UI.warnings.should.be.empty
+        end
+
+        it 'does not print a warning for a local pod that include script phases' do
+          spec = fixture_spec('coconut-lib/CoconutLib.podspec')
+          spec.test_specs.first.script_phase = { :name => 'Hello World', :script => 'echo "Hello World"' }
+          pod_target = PodTarget.new(config.sandbox, BuildType.static_library, {}, [], Platform.ios, [spec, *spec.test_specs],
+                                     [fixture_target_definition], nil)
+          pod_target.stubs(:platform).returns(:ios)
+          config.sandbox.stubs(:local?).with('CoconutLib').returns(true)
+          sandbox_state = Installer::Analyzer::SpecsState.new
+          sandbox_state.changed << 'CoconutLib'
           @installer.stubs(:pod_targets).returns([pod_target])
           @installer.stubs(:root_specs).returns([spec])
           @installer.stubs(:sandbox_state).returns(sandbox_state)
@@ -799,7 +922,7 @@ module Pod
 
     describe 'Integrating client projects' do
       it 'integrates the client projects' do
-        target = AggregateTarget.new(config.sandbox, false, {}, [], Platform.ios, fixture_target_definition,
+        target = AggregateTarget.new(config.sandbox, BuildType.static_library, {}, [], Platform.ios, fixture_target_definition,
                                      config.sandbox.root.dirname, nil, nil, {})
         @installer.stubs(:aggregate_targets).returns([target])
         Installer::UserProjectIntegrator.any_instance.expects(:integrate!)
@@ -820,8 +943,8 @@ module Pod
           @default_plugins = @installer.send(:plugins)
         end
 
-        it 'includes cocoapods-stats' do
-          @default_plugins['cocoapods-stats'].should == {}
+        it 'is empty' do
+          @default_plugins.should == {}
         end
       end
 
@@ -832,12 +955,28 @@ module Pod
         @installer.send(:run_plugins_pre_install_hooks)
       end
 
+      it 'runs plugins pre integrate hook' do
+        context = stub
+        Installer::PreIntegrateHooksContext.expects(:generate).returns(context)
+        HooksManager.expects(:run).with(:pre_integrate, context, Installer::DEFAULT_PLUGINS)
+        @installer.expects(:any_plugin_pre_integrate_hooks?).returns(true)
+        @installer.send(:run_plugins_pre_integrate_hooks)
+      end
+
       it 'runs plugins post install hook' do
         context = stub
         Installer::PostInstallHooksContext.expects(:generate).returns(context)
         HooksManager.expects(:run).with(:post_install, context, Installer::DEFAULT_PLUGINS)
         @installer.expects(:any_plugin_post_install_hooks?).returns(true)
         @installer.send(:run_plugins_post_install_hooks)
+      end
+
+      it 'runs plugins post integrate hook' do
+        context = stub
+        Installer::PostIntegrateHooksContext.expects(:generate).returns(context)
+        HooksManager.expects(:run).with(:post_integrate, context, Installer::DEFAULT_PLUGINS)
+        @installer.expects(:any_plugin_post_integrate_hooks?).returns(true)
+        @installer.send(:run_plugins_post_integrate_hooks)
       end
 
       it 'runs plugins source provider hook' do
